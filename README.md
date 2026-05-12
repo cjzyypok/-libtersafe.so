@@ -265,12 +265,10 @@ kill(pid, SIGCONT=0x12)            ; 0x262cb8 ─ 恢复目标
 ## 5. 反模拟器（Anti-Emulator）
 
 - 明文上报字段：`|emulator_name=`
-- `strncmp(..., "exynos9810")` × 2（@ `0x509818`）——三星 Galaxy S9/Note 9 SoC 校验，作为正版机器白名单标记
-- `getauxval()` × 3：
-  - `AT_RANDOM` (0x10) × 2 @ `0x5097d0`、`0x509e48`——读取 kernel 提供的随机种子，模拟器（QEMU / NoxPlayer）常有可识别的固定模式
-  - `AT_SECURE` (0x1a) × 1 @ `0x509e54`——SUID/SGID 标志
 - `uname()` × 1——读取内核 release / machine 字段比对模拟器特征
 - 大量加密的系统属性键：`ro.product.cpu.abi`、`ro.kernel.qemu`、`ro.hardware`、`init.svc.qemud`、`qemu.sf.fake_camera`、`ro.bootloader`、`ro.serialno` 等典型模拟器探针
+
+> **注意**：函数 `_ZN6TssSdk11gen_random2Ev` 周围（`0x5097c0` / `0x509e00`）出现的 `getauxval(0x10)` + `__system_property_get("ro.arch")` + `strncmp(..., "exynos9810")` 序列 **不是** Tencent 的反模拟器或机型白名单代码，而是 **GCC `-moutline-atomics` 编译选项**（GCC ≥ 10 默认开启）插入的运行时 AArch64 原子指令分派 boilerplate：探测 `HWCAP_ATOMICS`（bit 8 of AT_HWCAP = 0x10），命中后再额外排除 Exynos 9810（M3 Mongoose 核 LSE 原子指令性能/正确性 errata），最终在 `g_AllTssExportFunc + 0xfa8` 处保存的标志位用于选择 `ldaddal` (LSE) 还是 `ldaxr/stlxr` (LL/SC) 实现。源代码可参见 libgcc `lse-init.c`。本节早期版本曾误把它列为白名单 / 反模拟器检测，已更正——详见 §16。
 
 ---
 
@@ -447,7 +445,7 @@ def xor18(b):
 | `readlink` | 2 | `/proc/self/exe`、`/proc/[pid]/root` 解析符号链接 |
 | `popen`/`pclose` | 2 | 运行 shell（典型用法：`getprop`、`mount`、`id`） |
 | `ioctl` | 7 | 与自定义 driver / socket 交互；命中请求号 `0x6201/0x6205/0x6209/0x7`（疑似 socket SIOC 系列与 TP 自有命令） |
-| `getauxval` | 3 | `AT_RANDOM`、`AT_SECURE` |
+| `getauxval` | 3 | `AT_HWCAP` (0x10) × 2、`AT_HWCAP2` (0x1a) × 1 —— 来自 libgcc outline-atomics 初始化，非检测项 |
 | `getuid`/`getpid`/`getppid`/`gettid` | 51 | 进程身份与线程标识 |
 | `pthread_create`/`pthread_*` | 多 | 数个后台线程：扫描、上报、下载 |
 
@@ -461,7 +459,7 @@ def xor18(b):
 - **反 Hook**：函数头 opcode 比对、`mprotect` 区段 CRC、`9PtGum` (Frida Gum) 串匹配、`/proc/[pid]/maps` 模块名匹配、`dl_iterate_phdr` 模块枚举、`syscall` 旁路、`inotify` 文件属性监视。
 - **反注入**：`dladdr` 反查 API 源 SO、`dlsym` 名字白名单、`libtersafe.so` 自身段 CRC、APK `CertMD5` 校验。
 - **反 Root**：`getuid` UID、`stat/statfs/access` 检查 su 二进制 + Magisk / KernelSU 痕迹、`system_property_get` 读 `ro.build.tags`/`ro.debuggable`/`ro.secure`、`popen("getprop"/"mount"/"id")`。
-- **反模拟器**：`getauxval(AT_RANDOM/AT_SECURE)`、`uname()`、`system_property` 读 `ro.kernel.qemu`/`ro.hardware`/`init.svc.qemud`、`strncmp` SoC 型号白名单（如 `exynos9810`）、CPU ABI 检查。
+- **反模拟器**：`uname()`、`system_property` 读 `ro.kernel.qemu`/`ro.hardware`/`init.svc.qemud`、CPU ABI 检查（注：`getauxval(AT_HWCAP)` + `strncmp("exynos9810")` 是 libgcc outline-atomics 的运行时分派代码，**不是**检测点；详见 §5 备注 / §16）。
 - **内存巡检**：`MrpcsActiveSig` 主动签名扫描线程、`mrpcsc.data` 远端下发规则、`mvm_bk_proc/mvm_bk_task` 后台任务、`ms_data_crc` 自检。
 - **引擎层**：Unity Mono 反射（`Assembly-CSharp.dll` + `mono_*` 一族）、Vulkan/EGL/GL API 监控（`vk*`、`egl*`、`gl*`，尤其 `glReadPixels`/`glCopyTexImage2D`/`vkCmdCopyImage`）、UE4 反射（`libUE4.so` + `/Script/CoreUObject.`）。
 - **输入层**：`/proc/bus/input/devices` 枚举、`RecordTouchStart:name=pvp_mode` 触摸录制、操作频率 `rate=%.2f` 上报。
@@ -496,6 +494,26 @@ def xor18(b):
 
 ---
 
-## 16. 免责声明
+## 16. 误判更正（False Positives）
+
+本节登记**看起来像但实际上不是检测点**的代码片段，便于其它研究者复用本报告时少走弯路。
+
+### 16.1 `strncmp(..., "exynos9810")` + `getauxval(AT_HWCAP)` + `__system_property_get("ro.arch")`
+
+- **位置**：`_ZN6TssSdk11gen_random2Ev`+0x42e28 起，关键调用在 `0x5097c0`–`0x50985c`、`0x509e00`–`0x509edc`。
+- **看起来像**：三星机型白名单 / 反模拟器机型校验。
+- **实际是**：GCC `-moutline-atomics`（≥ 10.x 默认开启）在 AArch64 上生成的运行时原子指令分派器。逻辑：
+  1. `getauxval(AT_HWCAP=0x10)`，测试 bit8 = `HWCAP_ATOMICS`（LSE 原子指令支持位）。
+  2. CPU 不支持 LSE → flag=0，运行时走 LL/SC fallback（`ldaxr/stlxr` 循环）。
+  3. CPU 支持 LSE，但 `ro.arch == "exynos9810"` → 仍 flag=0（绕开三星 M3 Mongoose 已知 errata）。
+  4. CPU 支持 LSE 且非 Exynos 9810 → flag=1，运行时走 `ldaddal` 等单条 LSE 指令。
+- **如何辨认这是 libgcc 代码而不是 Tencent 代码**：分派开关被写到固定全局偏移、被该模块内**大量**自动生成的 `__aarch64_ldadd*` / `__aarch64_cas*` 函数读取；这些 wrapper 函数模式高度一致，且与 libgcc `lse-init.c` 源码逐字节匹配。
+- **影响**：与样本是否在模拟器上运行无关，与 root / hook 无关。
+
+如发现其它类似 false positive 欢迎提 issue / PR 在此补充。
+
+---
+
+## 17. 免责声明
 
 本报告仅用于安全研究、合规审计、防御方对接腾讯安全 SDK 时的排错与对账。报告**不包含也不教授**任何绕过 / 篡改方法，所有结论均通过对开源工具链（`binutils` / `capstone` / `pyelftools`）的静态使用得出；样本未在 root 环境或真机注入任何 hook 框架。请在所在司法管辖区允许的范围内使用本资料。
